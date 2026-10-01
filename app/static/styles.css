@@ -409,6 +409,8 @@ textarea:focus { outline: none; border-color: var(--primary); }
   padding: 1px 4px; border-radius: 5px;
 }
 .pv-clause:hover { background: rgba(255,255,255,.07); text-decoration: underline; }
+.pv-clause.in-group { border: 1px solid var(--purple); border-radius: 6px; padding: 0 6px; }
+.pv-row.cycle-group { border-color: var(--purple); }
 .pv-clause.deleted { color: var(--danger); }
 .pv-clause.warn { color: var(--warn); }
 .pv-clause.purple { color: var(--purple); }
@@ -452,6 +454,18 @@ textarea:focus { outline: none; border-color: var(--primary); }
 .pv-chain-node:hover { color: var(--text); background: rgba(255,255,255,.07); }
 .pv-chain-node.terminal { color: var(--danger); }
 .pv-chain-node.terminal:hover { background: var(--danger-bg); }
+
+/* 原因链节点：单个条款或强连通分量（循环组） */
+.pv-chain-step { display: inline-flex; align-items: center; }
+.pv-chain-step.is-group {
+  border: 1px solid var(--purple); border-radius: 7px;
+  padding: 0 5px; background: rgba(139,92,246,.08);
+}
+.pv-chain-step.cyclic .pv-chain-node { color: var(--purple); }
+.pv-chain-cycle {
+  color: var(--purple); font-size: 11px; margin-right: 2px; cursor: help;
+}
+.pv-owner { color: var(--purple); font-weight: 600; flex-shrink: 0; }
 
 .preview-actions {
   display: flex; gap: 10px; margin-top: 12px;

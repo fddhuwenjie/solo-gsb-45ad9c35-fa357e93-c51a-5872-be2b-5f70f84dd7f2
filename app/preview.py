@@ -8,9 +8,11 @@
 2. 定义术语绑定：删除前**唯一**绑定某定义的使用，删除后失去该唯一定义
    （未定义 / 无存活同名定义）、命中多个同名定义（歧义）或改绑其他定义。
 
-直接受影响的存活条款为根，沿「反向引用」边做多源 BFS，得到每个受影响条款
-到根因的最短原因链；等长链按文档顺序取字典序最小者；同一受影响条款（及其
-重复影响）只列一次。链上任一边处于引用环上时，整条链合并标注为循环链。
+直接受影响的存活条款为根，先把删除后存活引用图按**强连通分量（SCC）合并**：
+同一循环组只生成一个影响项、组内跨成员的同一直接影响去重；再在收缩后的
+SCC DAG 上沿「反向边」多源 BFS，得到每个受影响条款/循环组到根因的最短
+原因链；等长链按文档顺序取字典序最小者；链上任一节点为循环 SCC 时整条链
+标注循环。
 """
 from __future__ import annotations
 
@@ -263,13 +265,6 @@ def preview_deletion(preamble: str,
         for d in dets:
             add_direct(owner, ("term", d["kind"], d["message"], d["start"]), d)
 
-    # 根因条款（旧定义/被引目标）：取该根最小偏移明细
-    root_terminal: dict[str, str | None] = {}
-    for owner, dets in direct.items():
-        first = min(dets, key=lambda d: (d["start"],
-                                         _DETAIL_ORDER.get(d["kind"], 9)))
-        root_terminal[owner] = first.get("target_id")
-
     # ---- 3) 删除后存活条款上的引用图（含显式自引用，区间自指不计边） ----
     edges: dict[str, set[str]] = {cid: set() for cid in survivors_new}
     for cid in survivors_new:
@@ -284,79 +279,127 @@ def preview_deletion(preamble: str,
                     if tid != cid and tid in survivors_new_set:
                         edges[cid].add(tid)
 
-    # ---- 4) 多源 BFS（反向边）求最短距离 ----
-    roots = set(direct)
-    rev: dict[str, list[str]] = {cid: [] for cid in survivors_new}
+    # ---- 4) 存活引用图按强连通分量合并：同组节点只产生一个影响项 ----
+    comp = _scc(survivors_new, edges, doc)
+    groups: dict[int, list[str]] = {}
+    for cid in survivors_new:
+        groups.setdefault(comp[cid], []).append(cid)
+    for members in groups.values():
+        members.sort(key=lambda x: doc[x])
+    # 循环 SCC：多成员分量，或单成员上存在显式自环
+    cyclic_group: dict[int, bool] = {}
+    for cid, k in comp.items():
+        if len(groups[k]) > 1 or cid in edges[cid]:
+            cyclic_group[k] = True
+    # 分量代表条款（文档顺序最靠前）与分量文档顺序
+    rep = {k: members[0] for k, members in groups.items()}
+    comp_doc = {k: doc[members[0]] for k, members in groups.items()}
+
+    # 组内直接影响合并：跨成员的同一影响去重
+    # （key 取 (种类, 根因, 消息)：同组中对同一被删条款的同款失效只算一次）
+    comp_details: dict[int, list[dict]] = {}
+    for k in sorted(groups, key=lambda g: comp_doc[g]):
+        merged: list[dict] = []
+        seen_key: set[tuple] = set()
+        for cid in groups[k]:
+            for d in direct.get(cid, []):
+                key = (d["kind"], d.get("target_id"), d["message"])
+                if key in seen_key:
+                    continue
+                seen_key.add(key)
+                md = dict(d)
+                md["owner_id"] = cid
+                merged.append(md)
+        if merged:
+            merged.sort(key=lambda d: (doc[d["owner_id"]], d["start"],
+                                       _DETAIL_ORDER.get(d["kind"], 9)))
+            comp_details[k] = merged
+
+    # 每个根分量（含直接影响的分量）的根因条款（去重，按文档顺序）
+    root_terminal: dict[int, list[str]] = {}
+    for k, dets in comp_details.items():
+        terms = sorted({d.get("target_id") for d in dets if d.get("target_id")},
+                       key=lambda t: doc.get(t, 10 ** 9))
+        root_terminal[k] = terms  # type: ignore[assignment]
+
+    # ---- 5) SCC DAG 上多源 BFS（反向边）求最短分量距离 ----
+    c_edges: dict[int, set[int]] = {k: set() for k in groups}
     for u, vs in edges.items():
         for v in vs:
-            rev[v].append(u)
-    for vs in rev.values():
-        vs.sort(key=lambda x: doc[x])
+            if comp[u] != comp[v]:
+                c_edges[comp[u]].add(comp[v])
+    c_rev: dict[int, list[int]] = {k: [] for k in groups}
+    for u, vs in c_edges.items():
+        for v in vs:
+            c_rev[v].append(u)
+    for ks in c_rev.values():
+        ks.sort(key=lambda k: comp_doc[k])
 
-    dist: dict[str, int] = {r: 0 for r in roots}
-    dq: deque[str] = deque(sorted(roots, key=lambda x: doc[x]))
+    roots = set(comp_details)
+    dist: dict[int, int] = {r: 0 for r in roots}
+    dq: deque[int] = deque(sorted(roots, key=lambda k: comp_doc[k]))
     while dq:
         cur = dq.popleft()
-        for nxt in rev[cur]:
+        for nxt in c_rev[cur]:
             if nxt not in dist:
                 dist[nxt] = dist[cur] + 1
                 dq.append(nxt)
 
-    # 等长链取文档顺序字典序最小者：按距离分层，沿出边选 best 链最小的前驱
-    best: dict[str, list[str]] = {r: [r] for r in roots}
+    # 等长链取文档顺序字典序最小者：按距离分层，沿收缩出边选 best 链最小的前驱
+    best: dict[int, list[int]] = {r: [r] for r in roots}
     max_dist = max(dist.values(), default=0)
     for level in range(1, max_dist + 1):
-        layer = sorted((n for n in dist if dist[n] == level),
-                       key=lambda x: doc[x])
-        for n in layer:
-            preds = [p for p in edges[n] if dist.get(p) == level - 1]
+        layer = sorted((k for k in dist if dist[k] == level),
+                       key=lambda k: comp_doc[k])
+        for k in layer:
+            preds = [p for p in c_edges[k] if dist.get(p) == level - 1]
             chosen = min(preds,
-                         key=lambda p: [doc[q] for q in best[p]])
-            best[n] = [n] + best[chosen]
+                         key=lambda p: [comp_doc[q] for q in best[p]])
+            best[k] = [k] + best[chosen]
 
-    # ---- 5) 循环边：同属一个 SCC（含自环）的边 ----
-    comp = _scc(survivors_new, edges, doc)
-    comp_size: dict[int, int] = {}
-    for c in comp.values():
-        comp_size[c] = comp_size.get(c, 0) + 1
-
-    def is_cycle_edge(u: str, v: str) -> bool:
-        cu, cv = comp.get(u), comp.get(v)
-        if cu is None or cu != cv:
-            return False
-        return comp_size[cu] > 1 or u == v
-
-    # ---- 6) 组装影响行（每个存活条款至多一行，明细去重后按偏移排序）----
-    def chain_for(cid: str) -> tuple[list[dict], bool]:
-        ids = list(best[cid])
-        terminal = root_terminal.get(ids[-1])
-        cyclic = any(is_cycle_edge(ids[i], ids[i + 1])
-                     for i in range(len(ids) - 1))
-        entries = [_clause_brief(by_id.get(x)) for x in ids]
-        if terminal and terminal != ids[-1]:
-            entries.append(_clause_brief(by_id.get(terminal)))
-            cyclic = cyclic or is_cycle_edge(ids[-1], terminal)
-        return entries, cyclic
+    # ---- 6) 组装影响行（每个 SCC 至多一行；组内影响已去重）----
+    def group_node(k: int) -> dict:
+        members = groups[k]
+        node: dict = {
+            "id": rep[k],
+            "label": by_id[rep[k]].label,
+            "heading": by_id[rep[k]].heading or "",
+            "cycle": cyclic_group.get(k, False),
+        }
+        if len(members) > 1:
+            node["group"] = True
+            node["members"] = [_clause_brief(by_id[x]) for x in members]
+        return node
 
     impacts: list[dict] = []
-    for cid in sorted(dist, key=lambda x: (dist[x], doc[x])):
-        chain, cyclic = chain_for(cid)
-        c = by_id[cid]
-        dets = sorted(direct.get(cid, []),
-                      key=lambda d: (d["start"],
-                                     _DETAIL_ORDER.get(d["kind"], 9)))
+    for k in sorted(dist, key=lambda g: (dist[g], comp_doc[g])):
+        cks = best[k]
+        chain = [group_node(g) for g in cks]
+        for tid in root_terminal.get(cks[-1], []):
+            term_node = _clause_brief(by_id.get(tid))
+            term_node["terminal"] = True
+            chain.append(term_node)
+        cyclic = any(cyclic_group.get(g, False) for g in cks)
+
+        c = by_id[rep[k]]
+        members = groups[k]
+        dets_out = [{
+            "kind": d["kind"],
+            "message": d["message"],
+            "clause_id": d.get("owner_id"),
+            "target_id": d.get("target_id"),
+        } for d in comp_details.get(k, [])]
         impacts.append({
-            "clause_id": cid,
+            "clause_id": c.id,
             "label": c.label,
             "heading": c.heading or "",
-            "distance": dist[cid],
+            "distance": dist[k],
             "cycle": cyclic,
+            "group": len(members) > 1,
+            "members": [_clause_brief(by_id[x]) for x in members]
+            if len(members) > 1 else [],
             "chain": chain,
-            "details": [{
-                "kind": d["kind"],
-                "message": d["message"],
-                "target_id": d.get("target_id"),
-            } for d in dets],
+            "details": dets_out,
         })
 
     # 前置说明中的直接影响（术语使用；不能成为引用边节点）
@@ -364,20 +407,27 @@ def preview_deletion(preamble: str,
         dets = sorted(preamble_details,
                       key=lambda d: (d["start"],
                                      _DETAIL_ORDER.get(d["kind"], 9)))
-        terminal = dets[0].get("target_id")
         chain = [{"id": "preamble", "label": "前置说明", "heading": ""}]
-        if terminal:
-            chain.append(_clause_brief(by_id.get(terminal)))
+        terminals = sorted({d.get("target_id") for d in dets
+                            if d.get("target_id")},
+                           key=lambda t: doc.get(t, 10 ** 9))
+        for tid in terminals:
+            term_node = _clause_brief(by_id.get(tid))
+            term_node["terminal"] = True
+            chain.append(term_node)
         impacts.insert(0, {
             "clause_id": "preamble",
             "label": "前置说明",
             "heading": "",
             "distance": 0,
             "cycle": False,
+            "group": False,
+            "members": [],
             "chain": chain,
             "details": [{
                 "kind": d["kind"],
                 "message": d["message"],
+                "clause_id": None,
                 "target_id": d.get("target_id"),
             } for d in dets],
         })

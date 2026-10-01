@@ -581,8 +581,7 @@ function renderPreview() {
     `<span class="pv-stat"><b>${c.selected}</b> 项勾选</span>` +
     `<span class="pv-stat">+ <b>${c.cascade}</b> 项级联后代</span>` +
     `<span class="pv-stat">拟删除共 <b>${c.to_delete}</b> 项</span>` +
-    `<span class="pv-stat ${c.impacts ? "bad" : ""}">存活但受影响 <b>${c.impacts}</b> 条款` +
-    `（直接 ${c.direct} / 反向连锁 ${c.transitive}）</span>` +
+    `<span class="pv-stat ${c.impacts ? "bad" : ""}">存活但受影响 <b>${c.impacts}</b> 项（条款 / 循环组；直接 ${c.direct} / 反向连锁 ${c.transitive}）</span>` +
     `<span class="pv-stat">引用失效 <b>${c.ref}</b></span>` +
     `<span class="pv-stat">术语绑定变化 <b>${c.term}</b></span>` +
     (c.cycles ? `<span class="pv-stat bad">↺ 含循环链 <b>${c.cycles}</b></span>` : "");
@@ -607,7 +606,7 @@ function renderPreview() {
   }
   res.impacts.forEach((row, idx) => {
     const div = document.createElement("div");
-    div.className = "pv-row";
+    div.className = "pv-row" + (row.group ? " pv-group" : "");
     const head = document.createElement("div");
     head.className = "pv-row-head";
     const kindCls = (row.details[0]
@@ -616,15 +615,35 @@ function renderPreview() {
       `<span class="pv-idx">${idx + 1}</span>` +
       `<button type="button" class="pv-clause ${kindCls}">` +
       `${esc(row.label)} ${esc(row.heading)}</button>` +
+      (row.group
+        ? `<span class="pv-cycle" title="存活条款相互引用，已按强连通分量合并为一个循环组">↺ 循环组 ${row.members.length} 项</span>`
+        : (row.cycle
+          ? `<span class="pv-cycle" title="原因链上含引用循环">↺ 循环</span>`
+          : "")) +
       (row.distance > 0
         ? `<span class="pv-hop">连锁 ${row.distance} 跳</span>`
-        : `<span class="pv-hop direct">直接</span>`) +
-      (row.cycle ? `<span class="pv-cycle" title="原因链上含引用循环">↺ 循环</span>` : "");
+        : `<span class="pv-hop direct">直接</span>`);
     head.querySelector(".pv-clause").addEventListener("click", () => {
       if (row.clause_id === "preamble") locate("preamble");
       else locate(row.clause_id);
     });
     div.appendChild(head);
+
+    // 循环组成员：全部可点击定位（组本身只生成一个影响项）
+    if (row.group && row.members.length > 1) {
+      const mem = document.createElement("div");
+      mem.className = "pv-members";
+      row.members.forEach((m, i) => {
+        if (i > 0) mem.appendChild(document.createTextNode(" ⇄ "));
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "pv-member";
+        b.textContent = m.label + (m.heading ? ` ${m.heading}` : "");
+        b.addEventListener("click", () => locate(m.id));
+        mem.appendChild(b);
+      });
+      div.appendChild(mem);
+    }
 
     row.details.forEach((d) => {
       const meta = PREVIEW_KIND_META[d.kind] || { tag: d.kind, cls: "muted" };
@@ -633,7 +652,7 @@ function renderPreview() {
       line.innerHTML =
         `<span class="chip-tag">${meta.tag}</span>` +
         `<span class="pv-msg">${esc(d.message)}</span>`;
-      line.addEventListener("click", () => locate(row.clause_id, d.target_id));
+      line.addEventListener("click", () => locate(d.clause_id || row.clause_id, d.target_id));
       div.appendChild(line);
     });
 
@@ -641,13 +660,33 @@ function renderPreview() {
     chain.className = "pv-chain";
     row.chain.forEach((node, i) => {
       if (i > 0) chain.appendChild(document.createTextNode(" ▸ "));
+      if (node.group && node.members && node.members.length > 1) {
+        // 循环组节点：括号内展开成员，逐成员可点击定位
+        chain.appendChild(document.createTextNode("("));
+        node.members.forEach((m, j) => {
+          if (j > 0) chain.appendChild(document.createTextNode(" ⇄ "));
+          const mb = document.createElement("button");
+          mb.type = "button";
+          mb.className = "pv-chain-node group";
+          mb.textContent = m.label;
+          mb.title = `循环组成员：${m.label} ${m.heading}（点击定位）`;
+          mb.addEventListener("click", () => locate(m.id));
+          chain.appendChild(mb);
+        });
+        chain.appendChild(document.createTextNode(")"));
+        return;
+      }
       const b = document.createElement("button");
       b.type = "button";
-      b.className = "pv-chain-node";
-      b.textContent = node.label + (node.heading ? ` ${node.heading}` : "");
+      b.className = "pv-chain-node"
+        + (node.terminal ? " terminal" : "")
+        + (node.cycle ? " cycle" : "");
+      b.textContent = (node.cycle && !node.terminal ? "↺ " : "")
+        + node.label + (node.heading ? ` ${node.heading}` : "");
       const isTerminal = i === row.chain.length - 1;
-      b.classList.toggle("terminal", isTerminal);
-      b.title = isTerminal ? "根因（被删除目标 / 被移除定义）" : "点击定位";
+      b.title = isTerminal
+        ? "根因（被删除目标 / 被移除定义）"
+        : (node.cycle ? "引用循环（点击定位）" : "点击定位");
       b.addEventListener("click", () => locate(node.id));
       chain.appendChild(b);
     });
